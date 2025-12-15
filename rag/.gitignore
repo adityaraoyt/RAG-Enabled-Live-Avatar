@@ -1,0 +1,14 @@
+# Ignore environment variables
+.env
+
+# Ignore dependencies
+node_modules/
+
+# Ignore data folder
+/data/
+/.venv/
+/.vscode/
+
+# Ignore package files
+package.json
+package-lock.json
