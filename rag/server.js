@@ -18,6 +18,49 @@ const HF_EMBED_MODEL =
 
 const hf = new InferenceClient(HF_API_TOKEN);
 
+function normalizeHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter(
+      (m) =>
+        m &&
+        (m.role === "user" || m.role === "assistant") &&
+        typeof m.content === "string"
+    )
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
+}
+
+async function rewriteForRetrieval({ message, history }) {
+  if (!history || history.length === 0) return message;
+
+  const convo = history
+    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .join("\n");
+
+  const prompt = `
+Rewrite the LAST user message into a standalone question that can be understood without the conversation.
+Do NOT answer the question. Keep it short and specific.
+
+CONVERSATION:
+${convo}
+
+LAST USER MESSAGE:
+${message}
+
+Standalone question:
+`.trim();
+
+  const resp = await axios.post(`${OLLAMA_URL}/api/generate`, {
+    model: OLLAMA_MODEL,
+    prompt,
+    stream: false,
+    options: { temperature: 0 },
+  });
+
+  return (resp.data.response || message).trim();
+}
+
+
 // --- Embed user query with same embedder you used for ingestion ---
 async function embedQuery(text) {
   const result = await hf.featureExtraction({
@@ -50,7 +93,7 @@ const OLLAMA_URL = process.env.OLLAMA_URL || "http://127.0.0.1:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:3b";
 
 async function callLLM({ question, context }) {
-const system = `
+  const system = `
 You are an enterprise training instructor.
 
 You MUST rely on the provided CONTEXT for training-related questions.
@@ -72,7 +115,7 @@ Response guidelines:
 - Use plain, natural spoken language suitable for audio delivery.
 `.trim();
 
-const prompt = `
+  const prompt = `
 CONTEXT:
 ${context}
 
@@ -97,18 +140,22 @@ ${question}
 
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message, history = [] } = req.body;
+    const { message } = req.body;
+    const history = normalizeHistory(req.body.history);
 
-    const queryVec = await embedQuery(message);
-    const hits = await qdrantSearch(queryVec, 5);
+    const retrievalQuery = await rewriteForRetrieval({ message, history });
+    console.log("🔁 Retrieval query:", retrievalQuery);
+
+    const queryVec = await embedQuery(retrievalQuery);
+    const hits = await qdrantSearch(queryVec, 8);
+
 
     const MAX_CHARS_PER_CHUNK = 1200;
     const context = hits
       .map((h, idx) => {
         const p = h.payload || {};
-        const src = `${p.source_path || p.doc_id || "unknown"}${
-          p.page_number ? ` (page ${p.page_number})` : ""
-        }`;
+        const src = `${p.source_path || p.doc_id || "unknown"}${p.page_number ? ` (page ${p.page_number})` : ""
+          }`;
         const content = (p.content || "").slice(0, MAX_CHARS_PER_CHUNK);
         return `[#${idx + 1}] ${src}\n${content}`;
       })
@@ -148,52 +195,76 @@ app.post("/api/chat/stream", async (req, res) => {
       return res.status(400).json({ error: "message is required" });
     }
 
+    const history = normalizeHistory(req.body.history);
+
     // SSE headers
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
-    // 1) Embed query
-    const queryVec = await embedQuery(message);
+    // 0) Rewrite follow-up into standalone query for better retrieval
+    const retrievalQuery = await rewriteForRetrieval({ message, history });
+    console.log("🔁 Retrieval query (stream):", retrievalQuery);
 
-    // 2) Retrieve context
+    // 1) Embed rewritten query
+    const queryVec = await embedQuery(retrievalQuery);
+
+    // 2) Retrieve context from Qdrant
     const hits = await qdrantSearch(queryVec, 5);
 
     const MAX_CHARS_PER_CHUNK = 1200;
     const context = hits
       .map((h, idx) => {
         const p = h.payload || {};
-        const src = `${p.source_path || p.doc_id || "unknown"}${
-          p.page_number ? ` (page ${p.page_number})` : ""
-        }`;
+        const src = `${p.source_path || p.doc_id || "unknown"}${p.page_number ? ` (page ${p.page_number})` : ""
+          }`;
         const content = (p.content || "").slice(0, MAX_CHARS_PER_CHUNK);
         return `[#${idx + 1}] ${src}\n${content}`;
       })
       .join("\n\n");
 
-    // 3) Build prompt
+    // 3) Build conversation string for memory
+    const conversation = history
+      .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+      .join("\n");
+
+    // 4) Build prompt for Ollama
+    // Use YOUR callLLM rules, but streaming version
     const system = `
 You are an enterprise training instructor.
-You MUST answer using ONLY the provided CONTEXT.
-If the answer is not in the CONTEXT, say:
+
+You MUST rely on the provided CONTEXT for training-related questions.
+If a training-related answer is not in the CONTEXT, say:
 "I don’t have that in the training materials provided."
-Cite facts using [#1], [#2], etc.
+
+You MAY respond naturally to simple conversational messages such as greetings, acknowledgements, or closings (for example: "hi", "okay", "thanks") without applying training constraints.
+
+Response guidelines:
+- Keep the answer brief.
+- Short or conversational inputs should receive brief, natural replies.
+- Training or procedural answers must be clear, structured, and actionable.
+- When asked about steps or actions, always prioritize IMMEDIATE safety actions first.
+- Do not reorder steps unless explicitly instructed.
+- Answer ONLY what the question asks.
+- Do not add background unless it directly supports the answer.
+- Do not use symbols, numbering, headings, or labels.
+- Do not include citations, references, or source markers.
+- Use plain, natural spoken language suitable for audio delivery.
 `.trim();
 
     const prompt = `
 CONTEXT:
 ${context}
 
-QUESTION:
-${message}
+CONVERSATION SO FAR:
+${conversation}
 
-OUTPUT:
-- Bullet points
-- Optional "Next steps"
+USER:
+${message}
 `.trim();
 
-    // 4) Stream from Ollama
+    // 5) Stream from Ollama -> convert to SSE
     const ollamaResp = await axios.post(
       `${OLLAMA_URL}/api/generate`,
       {
@@ -206,16 +277,38 @@ OUTPUT:
       { responseType: "stream" }
     );
 
+    // IMPORTANT: Ollama streams NDJSON (one JSON per line)
+    // Lines can arrive fragmented -> buffer them
+    let buf = "";
+
     ollamaResp.data.on("data", (chunk) => {
-      const lines = chunk.toString().split("\n");
+      buf += chunk.toString("utf8");
+
+      const lines = buf.split("\n");
+      buf = lines.pop() || "";
+
       for (const line of lines) {
-        if (!line.trim()) continue;
-        const json = JSON.parse(line);
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let json;
+        try {
+          json = JSON.parse(trimmed);
+        } catch {
+          // ignore broken partial line (should be rare since we buffer)
+          continue;
+        }
+
         if (json.response) {
+          // Send as SSE data chunks
           res.write(`data: ${json.response}\n\n`);
         }
+
         if (json.done) {
-          res.write("event: done\ndata: done\n\n");
+          // Optional: send citations once at end as a single SSE data message
+          // res.write(`event: citations\ndata: ${JSON.stringify(hits)}\n\n`);
+
+          res.write(`data: done\n\n`);
           res.end();
         }
       }
@@ -223,13 +316,24 @@ OUTPUT:
 
     ollamaResp.data.on("error", (err) => {
       console.error("Ollama stream error", err);
+      res.write(`event: error\ndata: Ollama stream error\n\n`);
       res.end();
     });
 
+    ollamaResp.data.on("end", () => {
+      // If Ollama ends unexpectedly, still close SSE cleanly
+      if (!res.writableEnded) {
+        res.write(`data: done\n\n`);
+        res.end();
+      }
+    });
   } catch (err) {
     console.error(err);
-    res.write(`event: error\ndata: ${err.message}\n\n`);
-    res.end();
+    try {
+      res.write(`event: error\ndata: ${err.message}\n\n`);
+    } finally {
+      res.end();
+    }
   }
 });
 

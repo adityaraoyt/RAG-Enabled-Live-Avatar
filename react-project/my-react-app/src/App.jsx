@@ -20,12 +20,20 @@ export default function App() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    const res = await fetch(API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userMessage.content }),
-      signal: controller.signal,
-    });
+    const history = messages
+  .filter((m) => m.role === "user" || m.role === "assistant")
+  .slice(-12); // last 6 turns
+
+const res = await fetch(API_URL, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: userMessage.content,
+    history,
+  }),
+  signal: controller.signal,
+});
+
 
     const reader = res.body.getReader();
 const decoder = new TextDecoder();
